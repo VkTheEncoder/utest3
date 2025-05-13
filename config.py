@@ -1,18 +1,13 @@
-# config.py
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# ——— Telegram/API credentials ————————————————————————————————————
+# Fill these via environment variables or hard-code (not recommended)
+API_ID      = int(os.getenv("API_ID",    "YOUR_API_ID"))
+API_HASH    = os.getenv("API_HASH",      "YOUR_API_HASH")
+BOT_TOKEN   = os.getenv("BOT_TOKEN",     "YOUR_BOT_TOKEN")
 
-API_ID   = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
-API_BASE = os.getenv(
-    "ANIWATCH_API_BASE",
-    "http://localhost:4000/api/v2/hianime"
-)
+# Session name for Telethon’s .session file
+SESSION_NAME = os.getenv("SESSION_NAME", "bot_session")
 
-if not API_ID or not API_HASH:
-    raise RuntimeError("API_ID and API_HASH must be set in .env")
-
-# In‐memory per‐chat state (episode queues, etc.)
+# In-memory storage for per-chat state (search results, queues, etc.)
 STATE = {}

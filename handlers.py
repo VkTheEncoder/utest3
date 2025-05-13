@@ -4,52 +4,42 @@ import logging
 import asyncio
 
 from telethon import events
-from telethon.tl.custom import Button
+import config, fetcher, downloader
 
-import config
-import downloader
-
-# Pre‐compile URL regex
-URL_RE = re.compile(r'(https?://\S+)')
+URL_RE = re.compile(r"https?://hianimez\.to/watch/[^\s]+")
 
 async def register_handlers(client):
-    @client.on(events.NewMessage(incoming=True, pattern=r'.+'))
+    @client.on(events.NewMessage(incoming=True, pattern=URL_RE))
     async def on_message(event):
-        text = event.message.message or ""
+        url = URL_RE.search(event.text).group(0)
         chat_id = event.chat_id
 
-        # Extract first URL in the message
-        m = URL_RE.search(text)
-        if not m:
-            return  # ignore non‐URL messages
+        # Derive a safe filename
+        slug = urlparse(url).path.split("/")[-1]
+        ep_num = parse_qs(urlparse(url).query).get("ep", [""])[0]
+        safe_name = f"{slug}_ep{ep_num}"
 
-        url = m.group(1).rstrip('.,)')
-        safe_name = url.split('/')[-1].split('?')[0]  # fallback filename
-
-        # Choose output filename
-        out_dir = os.path.join(config.DOWNLOAD_DIR, chat_id.__str__())
+        out_dir = os.path.join(config.DOWNLOAD_DIR, slug)
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{safe_name}.mp4")
+        out_mp4 = os.path.join(out_dir, f"{safe_name}.mp4")
 
-        status = await event.reply(f"⏳ Downloading… `{url}`", parse_mode="markdown")
+        status = await event.reply(f"⏳ Starting download for `{ep_num}`…", parse_mode="markdown")
 
         try:
-            # Download in thread to avoid blocking
+            # 1) Get manifest + cookies via fetcher
+            m3u8, referer, cookies = await fetcher.fetch_hls_manifest(url)
+
+            # 2) Download via ffmpeg in a thread
             await asyncio.get_event_loop().run_in_executor(
                 None,
-                downloader.download_url,
-                url,
-                out_path
+                downloader.remux_hls,
+                m3u8, referer, cookies, out_mp4
             )
-            # Send the file back
-            await client.send_file(
-                chat_id,
-                out_path,
-                caption=f"▶️ Here’s your download:",
-                allow_cache=False
-            )
+
+            # 3) Send back the file
+            await client.send_file(chat_id, out_mp4, caption="▶️ Here you go!")
         except Exception as e:
             logging.exception("Download failed")
-            await client.send_message(chat_id, f"❌ Download error: {e}")
+            await event.reply(f"❌ Error: {e}")
         finally:
             await status.delete()

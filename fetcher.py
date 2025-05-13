@@ -1,12 +1,11 @@
 # fetcher.py
 
-import json
 import requests
-import asyncio
-from urllib.parse import urljoin
-
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from urllib.parse import urljoin
+import asyncio
+
+from playwright.async_api import async_playwright
 
 HTML_BASE = "https://hianimez.to"
 _USER_AGENT = {
@@ -20,7 +19,7 @@ _USER_AGENT = {
 
 def _sync_search(query: str) -> list[dict]:
     """
-    Blocking HTML scrape of /search for up to 5 results.
+    Blocking scrape of /search → [{"id": "/watch/...", "name": "..."}...]
     """
     resp = requests.get(
         urljoin(HTML_BASE, "/search"),
@@ -33,7 +32,7 @@ def _sync_search(query: str) -> list[dict]:
 
     out = []
     for a in soup.find_all("a", href=lambda h: h and h.startswith("/watch/"), limit=5):
-        href = a["href"]
+        href  = a["href"]
         title = (
             (a.find("img", alt=True) or {}).get("alt")
             or a.get("title")
@@ -46,7 +45,7 @@ def _sync_search(query: str) -> list[dict]:
 
 async def search_anime(query: str) -> list[dict]:
     """
-    Async wrapper around the blocking _sync_search.
+    Async wrapper around _sync_search.
     """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_search, query)
@@ -54,51 +53,37 @@ async def search_anime(query: str) -> list[dict]:
 
 async def fetch_episodes(anime_path: str) -> list[dict]:
     """
-    1) Load the watch page in headless Chromium (async).
-    2) Extract the <script id="__NEXT_DATA__"> JSON blob.
-    3) Parse pageProps to get the episodes array.
+    1) Headless-launch the watch page.
+    2) Wait for DOMContentLoaded.
+    3) Evaluate window.__NEXT_DATA__.props.pageProps.episodes.
+    4) Return [{"episodeId": "...", "number": "...", "title": "..."}...].
     """
-    page_path = anime_path.split("?", 1)[0]        # "/watch/raven-...-18168"
+    page_path = anime_path.split("?", 1)[0]
     url       = urljoin(HTML_BASE, page_path)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         page    = await browser.new_page()
 
-        # Load the page just enough to get the JSON blob
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
-        except PlaywrightTimeout:
-            # fall back; maybe scripts are still running
-            pass
+        # load just enough for Next.js to inject __NEXT_DATA__
+        await page.goto(url, wait_until="domcontentloaded")
 
-        # Wait up to 10s for the __NEXT_DATA__ script to appear
-        try:
-            tag = await page.wait_for_selector("script#__NEXT_DATA__", timeout=10_000)
-        except PlaywrightTimeout:
-            await browser.close()
-            return []
-
-        # Grab its contents and parse JSON
-        json_text = await tag.text_content()
-        data = json.loads(json_text)
-
+        # grab the whole Next.js data object
+        data = await page.evaluate("() => window.__NEXT_DATA__")
         await browser.close()
 
-    # The Next.js data lives under props.pageProps
+    # drill in
     props = data.get("props", {}).get("pageProps", {})
-
-    # Episodes may live under different keys depending on build:
-    eps_list = props.get("episodes") \
-            or props.get("anime", {}).get("episodes") \
-            or []
+    # episodes may live under different keys
+    eps_src = props.get("episodes") \
+           or props.get("anime", {}).get("episodes") \
+           or []
 
     out = []
-    for ep in eps_list:
-        # Next.js often gives episodeId as number or full link
-        eid = str(ep.get("episodeId") or ep.get("ep_id") or "")
-        num = str(ep.get("episodeNumber") or ep.get("episode") or eid)
-        title = ep.get("title") or ep.get("name") or ""
+    for ep in eps_src:
+        eid   = str(ep.get("episodeId") or ep.get("id") or "")
+        num   = str(ep.get("episodeNumber") or ep.get("index") or "")
+        title = ep.get("title") or ep.get("name") or f"Episode {num}"
         if not eid:
             continue
         out.append({"episodeId": eid, "number": num, "title": title})
@@ -107,13 +92,15 @@ async def fetch_episodes(anime_path: str) -> list[dict]:
 
 
 def fetch_tracks(episode_id: str) -> list[dict]:
-    # Subtitle stub (no change)
+    """
+    Stub for subtitles. Return [] or implement if you have JSON.
+    """
     return []
 
 
 async def fetch_sources_and_referer(episode_id: str) -> tuple[list[dict], str, str]:
     """
-    (Unchanged) Headless Chromium capture of the .m3u8 URL + cookies.
+    (Unchanged) headless browser grab of .m3u8 + cookies.
     """
     watch_url = f"{HTML_BASE}/watch/{episode_id}"
     async with async_playwright() as pw:
@@ -128,14 +115,14 @@ async def fetch_sources_and_referer(episode_id: str) -> tuple[list[dict], str, s
                 m3u8_url = resp.url
 
         page.on("response", capture)
-        await page.goto(watch_url, wait_until="networkidle")
-        await page.reload(wait_until="networkidle")
+        await page.goto(watch_url, wait_until="domcontentloaded")
+        await page.reload(wait_until="domcontentloaded")
 
         if not m3u8_url:
             await browser.close()
-            raise RuntimeError("Could not locate HLS manifest URL")
+            raise RuntimeError("HLS manifest not found")
 
-        cookies = await ctx.cookies()
+        cookies    = await ctx.cookies()
         cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
         await browser.close()
 

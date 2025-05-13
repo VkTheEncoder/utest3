@@ -1,31 +1,30 @@
 import os
-from yt_dlp import YoutubeDL
+import subprocess
 
-# Shared headers for all downloads
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/114.0.0.0 Safari/537.36"
-    )
-}
-
-def download_url(url: str, out_path: str):
+def remux_hls(m3u8_url: str, referer: str, cookies: str, out_path: str):
     """
-    Download any video/audio URL (mp4, m3u8, etc.) into out_path
-    using yt-dlp with retries, resume, and best‐quality.
+    Invoke ffmpeg to download & remux the HLS stream into MP4.
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    ydl_opts = {
-        "outtmpl": out_path,
-        "format": "best",
-        "http_headers": _HEADERS,
-        "retries": 10,
-        "continuedl": True,
-        "noplaylist": True,
-        "quiet": True,
-    }
+    headers = [
+        f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Safari/537.36\r\n",
+        f"Referer: {referer}\r\n",
+        f"Cookie: {cookies}\r\n",
+        "Accept: */*\r\n",
+    ]
 
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-headers", "".join(headers),
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "2",
+        "-i", m3u8_url,
+        "-c", "copy",
+        out_path
+    ]
+    subprocess.run(cmd, check=True)

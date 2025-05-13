@@ -4,7 +4,7 @@ import requests
 from playwright.sync_api import sync_playwright
 
 # ——— YOUR API BASE URL ———
-API_BASE = "https://hianimez.to"
+API_BASE = "http://localhost:4040/api/v2/hianime"
 
 
 def search_anime(query: str) -> list[dict]:

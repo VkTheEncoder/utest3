@@ -9,10 +9,9 @@ HTML_BASE = "https://hianimez.to"
 async def fetch_hls_manifest(episode_url: str):
     """
     1) Launch headless Chromium.
-    2) Intercept the first response whose URL contains ".m3u8".
-    3) Navigate to the episode_url, waiting for DOM load.
-    4) wait_for_response will resolve as soon as the HLS manifest is fetched.
-    5) Return (m3u8_url, referer, cookie_header_str).
+    2) Navigate to the watch URL (DOMContentLoaded).
+    3) Use a Future + page.on('response') to catch the first '.m3u8' URL.
+    4) Return (m3u8_url, referer, cookie_header_str).
     """
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -24,32 +23,38 @@ async def fetch_hls_manifest(episode_url: str):
             )
         )
         page = await context.new_page()
+        m3u8_future = asyncio.get_event_loop().create_future()
 
-        # Kick off navigation (no networkidle to avoid hangs)
-        goto = page.goto(episode_url, wait_until="domcontentloaded", timeout=20_000)
+        # Listener for any .m3u8 response
+        def _capture(response):
+            url = response.url
+            if ".m3u8" in url and not m3u8_future.done():
+                m3u8_future.set_result(url)
+
+        page.on("response", _capture)
+
+        # Start navigation (DOMContentLoaded)
+        goto_task = asyncio.create_task(
+            page.goto(episode_url, wait_until="domcontentloaded", timeout=20_000)
+        )
 
         try:
-            # Meanwhile, wait for the HLS manifest request to complete
-            response = await page.wait_for_response(
-                lambda res: ".m3u8" in res.url,
-                timeout=20_000
-            )
-            m3u8_url = response.url
-        except PlaywrightTimeout:
+            # Wait up to 20s for the manifest URL to be intercepted
+            m3u8_url = await asyncio.wait_for(m3u8_future, timeout=20)
+        except asyncio.TimeoutError:
             await browser.close()
             raise RuntimeError("Could not intercept HLS manifest URL (.m3u8)")
 
-        # Ensure navigation has finished (best‐effort)
+        # Ensure navigation finishes
         try:
-            await goto
+            await goto_task
         except PlaywrightTimeout:
             pass
 
-        # Gather cookies for ffmpeg headers
+        # Collect cookies for ffmpeg
         cookies = await context.cookies()
         cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
         await browser.close()
 
-    # referer is simply the watch page URL
     return m3u8_url, episode_url, cookie_str

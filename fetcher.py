@@ -5,7 +5,7 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 BASE_URL = "https://hianimez.to"
 _USER_AGENT = {
@@ -19,54 +19,69 @@ _USER_AGENT = {
 
 def _sync_search(query: str) -> list[dict]:
     """
-    Fast, blocking scrape of /search → first 5 results.
+    Blocking helper: scrape /search and return up to 5 matches.
     """
-    resp = requests.get(
-        urljoin(BASE_URL, "/search"),
-        params={"keyword": query},
-        headers=_USER_AGENT,
-        timeout=10
-    )
+    url = urljoin(BASE_URL, "/search")
+    resp = requests.get(url, params={"keyword": query}, headers=_USER_AGENT, timeout=10)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    out = []
+    results = []
     for a in soup.find_all("a", href=lambda h: h and h.startswith("/watch/"), limit=5):
         href = a["href"]
-        # pick a title from <img alt>, then title attr, then link text
-        title = (
-            (a.find("img", alt=True) or {}).get("alt")
-            or a.get("title")
-            or a.get_text(strip=True)
-        )
+        # Title from <img alt>, then title attr, then text
+        title = None
+        img = a.find("img", alt=True)
+        if img:
+            title = img["alt"].strip()
+        elif a.has_attr("title"):
+            title = a["title"].strip()
+        else:
+            title = a.get_text(strip=True)
         if href and title:
-            out.append({"id": href, "name": title.strip()})
-    return out
+            results.append({"id": href, "name": title})
+    return results
 
 
 async def search_anime(query: str) -> list[dict]:
+    """
+    Async wrapper around the blocking _sync_search.
+    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_search, query)
 
 
 async def fetch_episodes(anime_path: str) -> list[dict]:
     """
-    Renders the watch page in headless Chromium, waits for the JS-injected
-    episode list to appear, then scrapes every <a> whose href has '?ep='.
+    Uses headless Chromium to let the page's JS inject the episode links,
+    but avoids networkidle timeouts by only waiting for DOMContentLoaded
+    and then for the first "?ep=" links to appear.
     """
-    watch_base = anime_path.split("?", 1)[0]
-    url        = urljoin(BASE_URL, watch_base)
+    # Drop any existing ?ep=... so we load the main watch page
+    basepath = anime_path.split("?", 1)[0]
+    url      = urljoin(BASE_URL, basepath)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         page    = await browser.new_page()
-        await page.goto(url, wait_until="networkidle")
-        # This selector matches the container that the site uses to hold its ep links
-        # (you may need to tweak if HiAnimez tweaks its markup)
-        await page.wait_for_selector("div.episo de-list, div.eplist, ul.eplist", timeout=10_000)
 
-        # Now grab all the individual <a> tags inside it
-        anchors = await page.query_selector_all("div.eplist a, ul.eplist a, div.episodes a")
+        # 1) Navigate, but only wait for the document to be parsed
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+        except PlaywrightTimeout:
+            # still proceed; page probably loaded enough to run its JS
+            pass
+
+        # 2) Wait for at least one episode link to appear
+        selector = f'a[href^="{basepath}?ep="]'
+        try:
+            await page.wait_for_selector(selector, timeout=10_000)
+        except PlaywrightTimeout:
+            await browser.close()
+            return []  # give up if the JS never injected them
+
+        # 3) Grab them all
+        anchors = await page.query_selector_all(selector)
         episodes = []
         seen = set()
         for a in anchors:
@@ -78,15 +93,11 @@ async def fetch_episodes(anime_path: str) -> list[dict]:
                 continue
             seen.add(ep_id)
             label = (await a.inner_text()).strip() or f"Episode {ep_id}"
-            episodes.append({
-                "episodeId": ep_id,
-                "number":    label,
-                "title":     ""
-            })
+            episodes.append({"episodeId": ep_id, "number": label, "title": ""})
 
         await browser.close()
 
-    # Optional: sort by the numeric episodeId
+    # Sort by numeric id if possible
     try:
         episodes.sort(key=lambda e: int(e["episodeId"]))
     except ValueError:
@@ -96,35 +107,38 @@ async def fetch_episodes(anime_path: str) -> list[dict]:
 
 
 def fetch_tracks(episode_id: str) -> list[dict]:
-    return []  # as before
+    """
+    Subtitle stub: return [] unless you have a JSON endpoint.
+    """
+    return []
 
 
 async def fetch_sources_and_referer(episode_id: str) -> tuple[list[dict], str, str]:
     """
-    (unchanged) headless browser grab of the .m3u8 + cookies.
+    (Unchanged) headless Chromium capture of the .m3u8 URL + cookies.
     """
     watch_url = f"{BASE_URL}/watch/{episode_id}"
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        ctx     = await browser.new_context()
-        page    = await ctx.new_page()
+        context = await browser.new_context()
+        page    = await context.new_page()
 
-        m3u8 = None
-        def capture(r):
-            nonlocal m3u8
-            if r.url.endswith(".m3u8") and not m3u8:
-                m3u8 = r.url
+        m3u8_url = None
+        def capture(response):
+            nonlocal m3u8_url
+            if response.url.endswith(".m3u8") and m3u8_url is None:
+                m3u8_url = response.url
 
         page.on("response", capture)
-        await page.goto(watch_url, wait_until="networkidle")
-        await page.reload(wait_until="networkidle")
+        await page.goto(watch_url, wait_until="domcontentloaded")
+        await page.reload(wait_until="domcontentloaded")
 
-        if not m3u8:
+        if not m3u8_url:
             await browser.close()
             raise RuntimeError("Could not locate HLS manifest URL")
 
-        cookies = await ctx.cookies()
+        cookies = await context.cookies()
         cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
         await browser.close()
 
-    return [{"url": m3u8}], watch_url, cookie_str
+    return [{"url": m3u8_url}], watch_url, cookie_str

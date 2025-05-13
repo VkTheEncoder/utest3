@@ -1,119 +1,58 @@
-# fetcher.py
-
-import json
-import requests
 import asyncio
-from urllib.parse import urljoin
+from playwright.async_api import async_playwright
+from urllib.parse import urlparse, parse_qs
 
-from bs4 import BeautifulSoup
+HTML_BASE = "https://hianimez.to"
 
-HTML_BASE   = "https://hianimez.to"
-API_SEARCH  = urljoin(HTML_BASE, "/search")
-API_EP_LIST = urljoin(HTML_BASE, "/api/get-list-episode")
-API_SOURCES = urljoin(HTML_BASE, "/api/get-sources")
-
-# Use the same headers the site’s own JS uses
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/114.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "X-Requested-With": "XMLHttpRequest",
-}
-
-
-def _sync_search(query: str) -> list[dict]:
+async def fetch_hls_manifest(episode_url: str):
     """
-    Your old HTML scrape for the first 5 /search results
-    (no change, only using BeautifulSoup).
+    1) Headless‐launch the watch page.
+    2) Wait for the <video> element & click play.
+    3) Intercept the first .m3u8 request.
+    4) Return (m3u8_url, referer, cookie_header_str).
     """
-    resp = requests.get(
-        API_SEARCH,
-        params={"keyword": query},
-        headers=_HEADERS,
-        timeout=10
-    )
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/114.0.0.0 Safari/537.36"
+        ))
+        page = await context.new_page()
+        m3u8_url = None
 
-    out = []
-    for a in soup.select("a[href^='/watch/']")[:5]:
-        href  = a["href"]               # e.g. "/watch/slug-12345?ep=678"
-        title = (
-            (a.find("img", alt=True) or {}).get("alt")
-            or a.get("title")
-            or a.get_text(strip=True)
-        ).strip()
-        out.append({"id": href, "name": title})
-    return out
+        # Listen for manifest requests
+        page.on("request", lambda req: _capture_m3u8(req, lambda u: globals().update(m3u8_candidate=u)))
 
+        # Navigate
+        await page.goto(episode_url, wait_until="domcontentloaded")
 
-async def search_anime(query: str) -> list[dict]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync_search, query)
+        # Wait for video element
+        await page.wait_for_selector("video", timeout=10_000)
 
+        # Try clicking “play” if needed
+        try:
+            await page.click("button.ytp-play-button", timeout=2_000)
+        except:
+            pass
 
-def _sync_fetch_episodes(anime_path: str) -> list[dict]:
-    """
-    Calls the site’s own JSON API to get the full episode list.
-    This is the exact same endpoint the player’s JS uses,
-    so you’ll never see “no episodes found” again.
-    """
-    # anime_path looks like "/watch/slug-12345?ep=678"
-    slug_with_id = anime_path.split("/watch/")[-1].split("?", 1)[0]
-    # slug_with_id = "slug-12345"
-    slug, anime_id = slug_with_id.rsplit("-", 1)
-    resp = requests.get(
-        API_EP_LIST,
-        params={"slug": slug, "animeId": anime_id},
-        headers=_HEADERS,
-        timeout=10
-    )
-    resp.raise_for_status()
-    data = resp.json().get("data", [])
+        # Poll until we get a .m3u8 or timeout
+        for _ in range(30):
+            if m3u8_url:
+                break
+            await asyncio.sleep(0.5)
+        await browser.close()
 
-    episodes = []
-    for ep in data:
-        episodes.append({
-            "episodeId": str(ep["episodeId"]),        # numeric ID
-            "number":    str(ep["episodeNumber"]),    # e.g. "1", "2", …
-            "title":     ep.get("title", "")
-        })
-    return episodes
+    if not m3u8_url:
+        raise RuntimeError("Could not intercept .m3u8 URL")
+
+    # Build cookie header
+    cookies = await context.cookies()
+    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    return m3u8_url, episode_url, cookie_str
 
 
-async def fetch_episodes(anime_path: str) -> list[dict]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync_fetch_episodes, anime_path)
-
-
-def fetch_tracks(episode_id: str) -> list[dict]:
-    # keep your subtitle logic here, if any
-    return []
-
-
-def fetch_sources_and_referer(episode_id: str) -> tuple[list[dict], str, str]:
-    """
-    Calls the site’s player‐backed JSON API to get the real HLS URLs
-    and referer in one go—exactly what your browser extension sees.
-    """
-    resp = requests.get(
-        API_SOURCES,
-        params={"episodeId": episode_id},
-        headers=_HEADERS,
-        timeout=10
-    )
-    resp.raise_for_status()
-    js = resp.json().get("data", {})
-
-    sources = js.get("sources", [])              # [{"file": "...m3u8", ...}, …]
-    referer = js.get("referer", HTML_BASE)       # page URL
-
-    # if the API also hands you cookies or extra headers:
-    headers = js.get("headers", {})
-    # build ffmpeg‐style header block, if needed:
-    cookie_str = headers.get("Cookie", "")
-
-    return sources, referer, cookie_str
+def _capture_m3u8(req, setter):
+    url = req.url
+    if url.endswith(".m3u8"):
+        setter(url)

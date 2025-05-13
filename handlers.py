@@ -14,6 +14,7 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
 
 
 async def register_handlers(client):
+    # ── /search command ───────────────────────────────────────────────────────
     @client.on(events.NewMessage(
         incoming=True,
         outgoing=True,
@@ -21,34 +22,39 @@ async def register_handlers(client):
     ))
     async def search_handler(event):
         query, chat_id = event.pattern_match.group(1).strip(), event.chat_id
+
         try:
-            results = fetcher.search_anime(query)
+            results = await fetcher.search_anime(query)
         except Exception as e:
             logging.exception("Search failed")
             return await event.reply(f"❌ Search error: {e}")
+
         if not results:
             return await event.reply("🔍 No results found.")
 
         state = STATE.setdefault(chat_id, {})
         state.setdefault("anime_meta", {})
-        for a in results[:5]:
+        for a in results:
             state["anime_meta"][a["id"]] = a["name"]
 
-        buttons = [[Button.inline(a["name"], data=f"ANIME|{a['id']}".encode())]
-                   for a in results[:5]]
+        buttons = [
+            [Button.inline(a["name"], data=f"ANIME|{a['id']}".encode())]
+            for a in results
+        ]
         await event.reply("🔍 Select an anime:", buttons=buttons)
 
 
+    # ── Anime selected callback ────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ANIME|")))
     async def on_select_anime(event):
         await event.answer()
-        anime_id, chat_id = event.data.decode().split("|",1)[1], event.chat_id
+        anime_id, chat_id = event.data.decode().split("|", 1)[1], event.chat_id
         state = STATE.setdefault(chat_id, {})
         anime_name = state.get("anime_meta", {}).get(anime_id, anime_id)
         state["current_anime_name"] = anime_name
 
         try:
-            eps = fetcher.fetch_episodes(anime_id)
+            eps = await fetcher.fetch_episodes(anime_id)
         except Exception:
             logging.exception("Failed to fetch episodes")
             return await event.edit(
@@ -71,17 +77,25 @@ async def register_handlers(client):
 
         await event.edit(
             f"📺 Found {len(eps)} episodes of **{anime_name}**.\nPick one or Download All:",
-            buttons=buttons, parse_mode="markdown"
+            buttons=buttons,
+            parse_mode="markdown"
         )
 
 
+    # ── Single‐episode callback ────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"EP|")))
     async def on_single_episode(event):
         await event.answer()
-        episode_id = event.data.decode().split("|",1)[1]
-        await _download_episode(event.client, event.chat_id, episode_id, ctx_event=event)
+        episode_id = event.data.decode().split("|", 1)[1]
+        await _download_episode(
+            event.client,
+            event.chat_id,
+            episode_id,
+            ctx_event=event
+        )
 
 
+    # ── “Download All” callback ────────────────────────────────────────────────
     @client.on(events.CallbackQuery(data=lambda d: d and d.startswith(b"ALL|")))
     async def on_all(event):
         await event.answer()
@@ -100,26 +114,29 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
     safe_anime = "".join(c for c in anime_name if c.isalnum() or c in " _-").strip()
 
     edit_fn = ctx_event.edit if ctx_event else lambda txt, **k: client.send_message(chat_id, txt, **k)
-    status = await edit_fn(f"⏳ Downloading **{anime_name}** ep-{ep_num}…", parse_mode="markdown")
+    status = await edit_fn(
+        f"⏳ Downloading **{anime_name}** ep-{ep_num}…",
+        parse_mode="markdown"
+    )
 
     try:
         out_dir = os.path.join(DOWNLOAD_DIR, safe_anime)
         os.makedirs(out_dir, exist_ok=True)
 
-        # 1) Fetch sources + referer + cookies via Playwright
-        sources, referer, cookie_str = fetcher.fetch_sources_and_referer(episode_id)
+        # 1) Fetch sources + referer + cookies via Async Playwright
+        sources, referer, cookie_str = await fetcher.fetch_sources_and_referer(episode_id)
         m3u8     = sources[0]["url"]
         mp4_name = f"{safe_anime} ep-{ep_num}.mp4"
         out_mp4  = os.path.join(out_dir, mp4_name)
 
-        # 2) Download via ffmpeg + full headers
+        # 2) Download via ffmpeg + full headers (in thread)
         await asyncio.get_event_loop().run_in_executor(
             None,
             downloader.download_episode,
             m3u8, referer, cookie_str, out_mp4
         )
 
-        # 3) Subtitle selection & download
+        # 3) Pick subtitle by filename priority
         tracks   = fetcher.fetch_tracks(episode_id)
         priority = ["eng-2.vtt", "en.vtt", "eng.vtt", "english.vtt"]
         selected = None
@@ -141,7 +158,8 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
 
         # 4) Send video
         await client.send_file(
-            chat_id, out_mp4,
+            chat_id,
+            out_mp4,
             caption=f"▶️ **{anime_name}** ep-{ep_num}",
             parse_mode="markdown"
         )
@@ -149,14 +167,18 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
         # 5) Send subtitle (if any)
         if sub_path and os.path.exists(sub_path):
             await client.send_file(
-                chat_id, sub_path,
+                chat_id,
+                sub_path,
                 caption="📄 Subtitle",
                 file_name=os.path.basename(sub_path)
             )
 
     except Exception:
         logging.exception("Download error")
-        await client.send_message(chat_id, f"❌ Failed downloading **{anime_name}** ep-{ep_num}")
+        await client.send_message(
+            chat_id,
+            f"❌ Failed downloading **{anime_name}** ep-{ep_num}"
+        )
 
     finally:
         await status.delete()

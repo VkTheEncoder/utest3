@@ -1,47 +1,79 @@
 # fetcher.py
+
 import requests
-from config import API_BASE
+from playwright.sync_api import sync_playwright
 
-def search_anime(query: str, page: int = 1):
+# ——— YOUR API BASE URL ———
+API_BASE = "https://example.com/api"
+
+
+def search_anime(query: str) -> list[dict]:
     """
-    GET /api/v2/hianime/search?q={query}&page={page}
-    Returns data.animes: list of { id, name, poster, ... } :contentReference[oaicite:0]{index=0}
+    Call your search endpoint and return a list of {id, name} dicts.
     """
-    resp = requests.get(f"{API_BASE}/search", params={"q": query, "page": page})
+    resp = requests.get(f"{API_BASE}/search", params={"q": query})
     resp.raise_for_status()
-    return resp.json().get("data", {}).get("animes", [])
+    return resp.json()
 
-def fetch_episodes(anime_id: str):
+
+def fetch_episodes(anime_id: str) -> list[dict]:
     """
-    GET /api/v2/hianime/anime/{animeId}/episodes
-    Returns data.episodes: 
-      [ { number, title, episodeId, isFiller }, … ] :contentReference[oaicite:1]{index=1}
+    Call your episodes endpoint and return a list of
+    {"episodeId": ..., "number": ..., "title": ...} dicts.
     """
     resp = requests.get(f"{API_BASE}/anime/{anime_id}/episodes")
     resp.raise_for_status()
-    return resp.json().get("data", {}).get("episodes", [])
+    return resp.json()
 
-def fetch_sources_and_referer(episode_id: str):
+
+def fetch_tracks(episode_id: str) -> list[dict]:
     """
-    GET /api/v2/hianime/episode/sources?animeEpisodeId={episodeId}&server=hd-1&category=sub
-    Returns (sources, referer) :contentReference[oaicite:2]{index=2}
+    Call your subtitle/track endpoint and return a list of
+    {"file": ..., "lang"/"label": ...} dicts.
     """
-    resp = requests.get(
-        f"{API_BASE}/episode/sources",
-        params={"animeEpisodeId": episode_id, "server": "hd-1", "category": "sub"}
-    )
+    resp = requests.get(f"{API_BASE}/episode/{episode_id}/tracks")
     resp.raise_for_status()
-    data = resp.json().get("data", {})
-    return data.get("sources", []), data.get("headers", {}).get("Referer")
+    return resp.json()
 
-def fetch_tracks(episode_id: str):
+
+def fetch_sources_and_referer(episode_id: str) -> tuple[list[dict], str, str]:
     """
-    Pull the subtitles (“tracks”) from the same endpoint :contentReference[oaicite:3]{index=3}
+    Launch a headless browser, navigate to the watch page, let the site's
+    JS spin up the player, intercept the real .m3u8 URL and session cookies.
+    Returns:
+      - sources:  [{"url": "<fresh-master.m3u8>"}]
+      - referer:  the watch page URL (used as Referer header)
+      - cookies:  a "name=value; name2=value2" string for Cookie header
     """
-    # reuse the same call so we don’t double-scrape
-    sources, referer = fetch_sources_and_referer(episode_id)
-    data = requests.get(
-        f"{API_BASE}/episode/sources",
-        params={"animeEpisodeId": episode_id, "server": "hd-1", "category": "sub"}
-    ).json().get("data", {})
-    return data.get("tracks", [])
+    watch_url = f"https://YOUR-SITE/watch/{episode_id}"
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context()
+        page    = context.new_page()
+
+        m3u8_url = None
+        def _capture(response):
+            nonlocal m3u8_url
+            if response.url.endswith(".m3u8") and not m3u8_url:
+                m3u8_url = response.url
+
+        page.on("response", _capture)
+
+        # 1) Navigate and wait for all network calls to finish
+        page.goto(watch_url, wait_until="networkidle")
+        # 2) Some players only fetch the manifest on reload
+        page.reload(wait_until="networkidle")
+
+        if not m3u8_url:
+            browser.close()
+            raise RuntimeError("Could not locate HLS manifest URL")
+
+        # Gather cookies for the site
+        cookie_list = context.cookies()
+        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookie_list)
+
+        browser.close()
+
+    sources = [{"url": m3u8_url}]
+    referer = watch_url
+    return sources, referer, cookie_str

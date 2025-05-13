@@ -1,6 +1,4 @@
-import asyncio
-import logging
-
+import asyncio, logging
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
@@ -18,15 +16,14 @@ async def main():
     )
     await register_handlers(client)
 
-    # Handle FloodWait on startup
     while True:
         try:
             await client.start(bot_token=config.BOT_TOKEN)
-            logger.info("Bot started successfully")
+            logger.info("Bot started!")
             break
         except FloodWaitError as e:
-            wait = getattr(e, "seconds", None) or getattr(e, "retry_after", 60)
-            logger.warning(f"Flood wait {wait}s; retrying...")
+            wait = getattr(e, "seconds", 60)
+            logger.warning(f"Flood wait {wait}s; sleeping…")
             await asyncio.sleep(wait)
 
     await client.run_until_disconnected()

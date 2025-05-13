@@ -140,7 +140,7 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
         out_dir = os.path.join(DOWNLOAD_DIR, safe_anime)
         os.makedirs(out_dir, exist_ok=True)
 
-        # 1) Fetch & remux HLS → MP4
+        # 1) Fetch & download via yt-dlp → MP4
         sources, referer = fetcher.fetch_sources_and_referer(episode_id)
         m3u8     = sources[0].get("url") or sources[0].get("file")
         mp4_name = f"{safe_anime} ep-{ep_num}.mp4"
@@ -148,7 +148,7 @@ async def _download_episode(client, chat_id: int, episode_id: str, ctx_event=Non
 
         await asyncio.get_event_loop().run_in_executor(
             None,
-            downloader.remux_hls,
+            downloader.download_episode,
             m3u8, referer, out_mp4
         )
 
